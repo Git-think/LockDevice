@@ -23,10 +23,12 @@ from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as 
                             PrimaryPushSettingCard)
 
 _main = sys.modules.get("__main__")
+_FROZEN = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
 if _main is not None and hasattr(_main, "load_plugins") and hasattr(_main, "_build_plugin_api"):
     core = _main                    # 由 lock_device.py 作入口启动时直接复用它（不重复导入本体）
 else:
     import lock_device as core      # 独立导入 gui 时
+    _FROZEN = bool(getattr(core, "IS_FROZEN", _FROZEN))
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -42,7 +44,7 @@ def _app_icon():
 
 def _spawn(*args):
     exe = core._self_path()
-    cmd = [exe, *args] if getattr(sys, "frozen", False) else [core._pythonw_path(), exe, *args]
+    cmd = [exe, *args] if _FROZEN else [core._pythonw_path(), exe, *args]
     subprocess.Popen(cmd, creationflags=_CREATE_NO_WINDOW)
 
 

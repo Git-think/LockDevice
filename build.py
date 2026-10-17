@@ -1,17 +1,34 @@
 # -*- coding: utf-8 -*-
-"""LockDevice 一键打包为单文件 exe（PyInstaller）。
+"""LockDevice 一键打包为单文件 exe（Nuitka）。
 
 用法：
   · 双击 build.bat（推荐，自动用 .venv）
   · 或在 venv 下运行：  python build.py
+       python build.py tk qt         # 只打指定变体
+       python build.py --upgrade     # 先把依赖升到最新再打包
+       python build.py --clean       # 丢弃上次构建缓存（编译更慢）
+       python build.py --mingw64     # 强制用 MinGW64 编译（本机无 MSVC 时）
 
-产物：dist\\LockDevice-<版本>.exe
+产物：dist\\LockDevice-<版本>-<变体>.exe
   · 文件名自动带版本号；exe 属性（右键→详细信息）也写入版本信息。
   · 版本号自动从 lock_device.py 的 VERSION 读取，无需在这里手动改。
+
+为什么用 Nuitka（替代 PyInstaller）：
+  · onefile 支持「解压缓存」：--onefile-cache-mode=cached + 固定 tempdir-spec，
+    解压内容跨次复用、不再每次启动都解压（PyInstaller 官方明确不做）。
+  · 支持 onefile 启动图（--onefile-windows-splash-screen-image），盖住首启解压空窗。
+  · 编译后跑得更快；产物直接是 C 编译的可执行文件。
+
+运行时约定（lock_device.py 已适配，见其顶部「Nuitka 兼容层」）：
+  · 冻结判定：Nuitka 不设 sys.frozen —— 本体用 "__compiled__" in globals() 识别，
+    并在导入早期补齐 sys.frozen/_MEIPASS 兼容 shim。
+  · 界面变体：各 exe 里打进 "_lockdevice_variant.txt"（qt / tk），本体读它决定界面，
+    避免在后台命令（--guard/--watch/--plugin 等）里白白导入 PySide6。
 """
 import os
 import re
 import sys
+import shutil
 import subprocess
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +41,9 @@ PY = sys.executable
 NAME = "LockDevice"            # 内部名；安装到本机后固定为 LockDevice.exe
 ICON = "lock_device.ico"
 SRC = "lock_device.py"
-VER_FILE = "_version_info.txt"  # 临时生成的版本资源，打包后自动删除
+SPLASH = "splash.png"          # onefile 启动图（缺失时自动用 scripts/make_splash.py 生成）
+SPLASH_TOOL = os.path.join("scripts", "make_splash.py")
+BUILD_ROOT = os.path.join("build_nuitka")   # Nuitka 的输出中间目录（按变体分子目录）
 
 
 def read_version():
@@ -46,40 +65,29 @@ def version_tuple(v):
     return tuple(parts)
 
 
-def write_version_info(v):
-    """生成 Windows 版本资源文件，让 exe 属性里显示文件/产品版本。"""
-    fv = version_tuple(v)
-    text = f"""# UTF-8 - PyInstaller 版本资源（build.py 自动生成）
-VSVersionInfo(
-  ffi=FixedFileInfo(
-    filevers={fv}, prodvers={fv},
-    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
-  kids=[
-    StringFileInfo([StringTable('080404b0', [
-      StringStruct('CompanyName', 'LockDevice'),
-      StringStruct('FileDescription', 'LockDevice 专注锁定'),
-      StringStruct('FileVersion', '{v}'),
-      StringStruct('InternalName', 'LockDevice'),
-      StringStruct('OriginalFilename', 'LockDevice.exe'),
-      StringStruct('ProductName', 'LockDevice 专注锁定'),
-      StringStruct('ProductVersion', '{v}')])]),
-    VarFileInfo([VarStruct('Translation', [0x0804, 1200])])])
-"""
-    with open(VER_FILE, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
 VERSION = read_version()
-OUT_NAME = f"{NAME}-{VERSION}.exe"   # 最终分发文件名，带版本号
+VER4 = ".".join(str(x) for x in version_tuple(VERSION))   # 1.5.2 -> 1.5.2.0（exe 版本资源要 4 段）
 
 print("=" * 50)
-print("  LockDevice · 一键打包")
+print("  LockDevice · 一键打包（Nuitka）")
 print("=" * 50)
-print("解释器:", PY)
+print("解释器:", PY, f"(Python {sys.version_info.major}.{sys.version_info.minor})")
 print("版本号:", VERSION, "（自动读取自 lock_device.py）")
 
 if not os.path.exists(ICON):
     print(f"⚠ 找不到图标 {ICON}，将不带图标打包。")
+# onefile 启动图：没有就调 scripts/make_splash.py 生成（需要 Pillow；失败则不带启动图）
+if not os.path.exists(SPLASH):
+    if os.path.exists(SPLASH_TOOL):
+        print("启动图缺失，尝试生成", SPLASH, "...")
+        try:
+            r = subprocess.run([PY, SPLASH_TOOL], capture_output=True, text=True)
+            if r.returncode != 0:
+                print("⚠ 生成失败（可 pip install pillow 后重试）：", (r.stderr or "").strip()[-200:])
+        except OSError as e:
+            print("⚠ 生成失败：", e)
+    if not os.path.exists(SPLASH):
+        print("⚠ 无启动图，onefile 首启解压期间将没有提示。")
 
 REQ = "requirements.txt"
 
@@ -98,7 +106,7 @@ def required_pkgs():
             if line:
                 out.append(re.split(r"[<>=!~;\[\s]", line, maxsplit=1)[0].strip())
         return [n for n in out if n]
-    return ["customtkinter", "pyinstaller"]
+    return ["customtkinter", "nuitka"]
 
 
 def installed_pkgs():
@@ -109,21 +117,27 @@ def installed_pkgs():
             for ln in (r.stdout or "").splitlines() if ln.strip()}
 
 
-UPGRADE = any(a in ("--upgrade", "-U", "upgrade") for a in sys.argv[1:])
-if UPGRADE:
-    print("\n[1/2] 升级所有依赖到最新版（--upgrade，不管是否已安装）...")
-    args = ["-r", REQ] if os.path.exists(REQ) else required_pkgs()
-    subprocess.run([PY, "-m", "pip", "install", "--upgrade", *args])
-else:
-    print("\n[1/2] 检测依赖（pip list，只装缺失的；加 --upgrade 可强制全升级）...")
-    _missing = [p for p in required_pkgs() if _norm(p) not in installed_pkgs()]
-    if _missing:
-        print("  缺少：" + ", ".join(_missing) + " → 安装中 ...")
-        subprocess.run([PY, "-m", "pip", "install", *_missing])
+def ensure_build_env():
+    """确保 nuitka 已安装；--upgrade 时把所有依赖升到最新。"""
+    upgrade = any(a in ("--upgrade", "-U", "upgrade") for a in sys.argv[1:])
+    if upgrade:
+        print("\n[1/2] 升级所有依赖到最新版（--upgrade，不管是否已安装）...")
+        args = ["-r", REQ] if os.path.exists(REQ) else required_pkgs()
+        subprocess.run([PY, "-m", "pip", "install", "--upgrade", *args])
     else:
-        print("  依赖已齐全，跳过安装。")
+        print("\n[1/2] 检测依赖（pip list，只装缺失的；加 --upgrade 可强制全升级）...")
+        have = installed_pkgs()
+        _missing = [p for p in required_pkgs() if _norm(p) not in have]
+        if _missing:
+            print("  缺少：" + ", ".join(_missing) + " → 安装中 ...")
+            subprocess.run([PY, "-m", "pip", "install", *_missing])
+        else:
+            print("  依赖已齐全，跳过安装。")
+    r = subprocess.run([PY, "-m", "nuitka", "--version"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("❌ 无法运行 Nuitka：", (r.stderr or "").strip()[:300])
+        sys.exit(1)
 
-write_version_info(VERSION)
 
 # 4 个变体：(后缀, 含 Qt 界面, 含插件, 说明)
 VARIANTS = [
@@ -133,59 +147,90 @@ VARIANTS = [
     ("qt",         True,  False, "Qt · 无插件"),
 ]
 _names = {s for s, *_ in VARIANTS}
+_flags = {a for a in sys.argv[1:] if a.startswith("-")}
 _only = [a for a in sys.argv[1:] if a in _names]   # python build.py qt / tk-plugins ...（不指定则全打）
 _todo = [v for v in VARIANTS if not _only or v[0] in _only]
 
 
+def write_variant_marker(path, suffix):
+    """把变体标注写进打包内容：本体据此直接选界面（不必导入 PySide6 探测）。"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("qt" if suffix.startswith("qt") else "tk")
+
+
 def build_one(suffix, with_gui, with_plugins, desc):
     print(f"\n===== 构建 {suffix} · {desc} =====")
-    a = [PY, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
-         "--name", NAME, "--version-file", VER_FILE]
-    if with_gui:    # Qt 现代界面：只收 gui 模块 + qfluentwidgets 资源；PySide6 交给自动分析（不 collect-all）
-        a += ["--hidden-import", "gui.app", "--hidden-import", "gui.lock",
-              "--collect-all", "qfluentwidgets",
-              # qt 版彻底不含 tk：模式一锁屏走 gui.lock（Qt 原生），故排除 customtkinter 与 tkinter 本身
-              "--exclude-module", "customtkinter",
-              "--exclude-module", "tkinter", "--exclude-module", "_tkinter"]
-        # qfluentwidgets 是纯 QWidget 组件，排除这些重型 Qt 模块（仅 WebEngine 就上百 MB）→ 大幅瘦身
-        for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtWebEngineQuick", "QtWebChannel",
-                  "QtQml", "QtQuick", "QtQuick3D", "QtQuickWidgets", "QtQuickControls2",
-                  "Qt3DCore", "Qt3DRender", "Qt3DExtras", "QtCharts", "QtDataVisualization",
-                  "QtMultimedia", "QtMultimediaWidgets", "QtPdf", "QtPdfWidgets", "QtSensors",
-                  "QtSerialPort", "QtBluetooth", "QtPositioning", "QtLocation",
-                  "QtDesigner", "QtHelp", "QtTest"):
-            a += ["--exclude-module", "PySide6." + m]
-    else:           # tkinter：收 customtkinter，排除 Qt，体积最小
-        a += ["--collect-all", "customtkinter",
-              "--exclude-module", "PySide6", "--exclude-module", "qfluentwidgets",
-              "--exclude-module", "shiboken6", "--exclude-module", "gui"]
+    out_dir = os.path.join(BUILD_ROOT, suffix)
+    marker = os.path.join(out_dir, "_variant_marker")
+    os.makedirs(out_dir, exist_ok=True)
+    write_variant_marker(marker, suffix)
+
+    a = [PY, "-m", "nuitka",
+         "--mode=onefile",
+         "--assume-yes-for-downloads",       # 缺编译器时自动下载 MinGW64（有 MSVC 则不用）
+         "--windows-console-mode=disable",   # 等价 PyInstaller 的 --windowed
+         "--output-dir=" + out_dir,
+         "--output-filename=" + f"{NAME}-{VERSION}-{suffix}.exe",
+         # exe 属性（右键→详细信息）：与 PyInstaller 时期的版本资源等价
+         "--company-name=" + NAME,
+         "--product-name=LockDevice 专注锁定",
+         "--file-version=" + VER4,
+         "--product-version=" + VER4,
+         # onefile 解压缓存：解压内容留在固定目录、跨次复用（首启解压一次，之后不再解压）
+         "--onefile-cache-mode=cached",
+         "--onefile-tempdir-spec={CACHE_DIR}/LockDevice/bin/{VERSION}",
+         # 变体标注 + 插件目录（插件按数据文件原样带，保留「热添加/覆盖」能力）
+         "--include-data-files=" + f"{marker}=_lockdevice_variant.txt",
+    ]
     if with_plugins and os.path.isdir("plugins"):
-        a += ["--add-data", "plugins" + os.pathsep + "plugins"]
+        # 插件按「数据文件」原样带（保留热添加/热覆盖能力）。
+        # 注意：Nuitka 默认不收 .py 作为数据文件（视为代码），必须用显式文件模式强制；
+        # 用绝对路径 + *.py 通配，避免把 __pycache__ 等带进去。
+        _plug_pat = os.path.join(os.path.abspath("plugins"), "*.py")
+        a += ["--include-data-files=" + _plug_pat + "=plugins/"]
     if os.path.exists(ICON):
-        a += ["--icon", ICON, "--add-data", f"{ICON}{os.pathsep}."]
+        a += ["--windows-icon-from-ico=" + ICON,
+              "--include-data-files=" + f"{ICON}={ICON}"]
+    if os.path.exists(SPLASH):
+        a += ["--onefile-windows-splash-screen-image=" + SPLASH]
+    if "--mingw64" in _flags:
+        a += ["--mingw64"]
+    if "--clean" in _flags:
+        a += ["--remove-output"]
+
+    if with_gui:    # Qt 现代界面：PySide6/qfluentwidgets；qt 变体彻底不含 tk
+        a += ["--enable-plugin=pyside6",
+              "--include-package-data=qfluentwidgets",
+              "--nofollow-import-to=tkinter",
+              "--nofollow-import-to=customtkinter"]
+    else:           # tkinter：收 customtkinter（含主题/字体数据），排除 Qt
+        a += ["--enable-plugin=tk-inter",
+              "--include-package-data=customtkinter",
+              "--nofollow-import-to=PySide6",
+              "--nofollow-import-to=qfluentwidgets",
+              "--nofollow-import-to=shiboken6",
+              "--nofollow-import-to=gui"]
     a.append(SRC)
     ret = subprocess.run(a).returncode
-    built = os.path.join("dist", NAME + ".exe")
+    built = os.path.join(out_dir, f"{NAME}-{VERSION}-{suffix}.exe")
     out = os.path.join("dist", f"{NAME}-{VERSION}-{suffix}.exe")
     if ret == 0 and os.path.exists(built):
+        os.makedirs("dist", exist_ok=True)
         try:
             if os.path.exists(out):
                 os.remove(out)
             os.replace(built, out)
             return out
         except OSError as e:
-            print("⚠ 重命名失败：", e)
+            print("⚠ 移动到 dist 失败：", e)
             return built
     return None
 
 
-print(f"\n[2/2] 打包（{len(_todo)} 个变体，首次较慢）...")
-results = [(s, d, build_one(s, g, p, d)) for s, g, p, d in _todo]
+ensure_build_env()
 
-try:
-    os.remove(VER_FILE)
-except OSError:
-    pass
+print(f"\n[2/2] 打包（{len(_todo)} 个变体，Nuitka 首次编译较慢，之后有缓存加速）...")
+results = [(s, d, build_one(s, g, p, d)) for s, g, p, d in _todo]
 
 print("\n" + "=" * 58)
 print(f"  LockDevice v{VERSION} · 打包结果（dist\\）")

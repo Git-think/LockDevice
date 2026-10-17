@@ -41,10 +41,12 @@
 ## 从源码运行 / 打包
 
 ```bash
-pip install customtkinter
+pip install -r requirements.txt
 python lock_device.py     # 运行
-python build.py           # 打包 → dist\LockDevice-<版本>.exe
+python build.py           # 打包（Nuitka）→ dist\LockDevice-<版本>-<变体>.exe
 ```
+
+打包用 **Nuitka**（单文件 exe，C 编译）：onefile 带**解压缓存**（`--onefile-cache-mode=cached`，首启解压一次、之后复用）；启动图 `splash.png` 由 `scripts/make_splash.py` 生成（缺了会自动补）。本机无 MSVC 时加 `--mingw64`（首次自动下载工具链；**编译缓存默认在 C 盘 AppData，数百 MB~数 GB，C 盘紧张可设 `NUITKA_CACHE_DIR` 到别的盘**）；加 `--clean` / `--upgrade` 分别清构建缓存 / 升依赖。产物 4 个变体：`tk`、`tk-plugins`、`qt`、`qt-plugins`（只打某几个：`python build.py tk qt`）。
 
 **发布新版**：改 `lock_device.py` 顶部的 `VERSION` 并在 `CHANGELOG` 加一条，推送到 `main`——
 GitHub Actions 会自动构建并发布 Release（发布说明取自 `CHANGELOG`）。

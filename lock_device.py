@@ -50,6 +50,81 @@ except Exception:
 if sys.platform != "win32":
     raise SystemExit("此程序仅支持 Windows。")
 
+# ------------------------------------------------------------------ Nuitka 兼容层
+# 编译（Nuitka）：在导入早期补齐冻结相关属性，让下面所有逻辑与 PyInstaller 时期一致：
+#   · Nuitka 不设 sys.frozen —— 用 __compiled__ 识别，并补一个 sys.frozen=True；
+#   · Nuitka 不设 sys._MEIPASS（onefile/standalone 都不设）—— 用 _meipass() 统一求，
+#     onefile 取「解压出的解释器所在目录」，standalone 取 exe 同目录。
+# 这些 shim 放在最前面，_self_path() / _icon_path() / _plugins_dirs() 等后续逻辑才可靠。
+IS_FROZEN = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+
+
+# 界面变体标注：打包时写入 _lockdevice_variant.txt（qt / tk）。
+# 有标注 → 直接按标注选界面，后台命令（--guard/--watch/--plugin 等）不必白导入 PySide6 探测；
+# 无标注（源码运行 / 旧产物）→ 保持原「试导入」逻辑。
+_VARIANT_FILE = "_lockdevice_variant.txt"
+
+
+def _meipass():
+    """冻结态资源根目录（打包进去的 ico/plugins/_lockdevice_variant.txt 等的所在目录）。
+
+    · PyInstaller：sys._MEIPASS 直接可用（onefile/onedir 都有）。
+    · Nuitka onefile：不设 sys._MEIPASS；数据文件解压后与「解压出来的解释器」
+      （sys.executable 所在目录）同放，而不是与原 exe 同目录 —— 取 dirname(sys.executable)。
+    · Nuitka standalone：数据就在 exe 同目录，同样等于 dirname(sys.executable)。
+    · 兜底：用户从别处运行（如受保护缓存副本）时，回退到 argv[0] 所在目录。
+    """
+    p = getattr(sys, "_MEIPASS", None)
+    if p:
+        return p
+    if IS_FROZEN:
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        arg_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        if arg_dir != exe_dir and os.path.isfile(os.path.join(arg_dir, _VARIANT_FILE)):
+            return arg_dir          # 从副本运行：资源跟着“入口文件”所在目录
+        return exe_dir
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+if IS_FROZEN and not getattr(sys, "frozen", False):
+    sys.frozen = True            # 兼容既有判断（_self_path / _app_cmd / gui 等）
+if IS_FROZEN and not getattr(sys, "_MEIPASS", None):
+    sys._MEIPASS = _meipass()
+
+
+def _read_variant():
+    try:
+        p = os.path.join(_meipass(), _VARIANT_FILE)
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                v = f.read().strip().lower()
+            if v in ("qt", "tk"):
+                return v
+    except OSError:
+        pass
+    return None
+
+
+VARIANT = _read_variant()        # "qt" / "tk" / None
+IS_QT_VARIANT = VARIANT == "qt"
+_QT_TRIED = None                 # _qt_available() 的探测结果缓存（每进程只试一次导入）
+
+# 让 sys.modules["__main__"] 暴露主模块属性（Nuitka 默认不暴露，PyInstaller 会）。
+# 作用：gui/app.py 的「复用本体」探测（__main__ 上有 load_plugins/_build_plugin_api）成立，
+#           于是 core = __main__，不会再去 `import lock_device` 触发「主模块第二次顶层执行」。
+# PyInstaller / 源码态下条件不成立（其 __main__ 本就带属性），此块自动跳过；幂等。
+try:
+    _main_mod = sys.modules.get("__main__")
+    if (_main_mod is not None and not hasattr(_main_mod, "load_plugins")
+            and _main_mod is sys.modules.get(__name__)):
+        _main_view = types.ModuleType("__main__")
+        _main_view.__dict__ = _main_mod.__dict__      # 同一字典：属性实时同步
+        _main_view.__spec__ = getattr(_main_mod, "__spec__", None)
+        _main_view.__loader__ = getattr(_main_mod, "__loader__", None)
+        sys.modules["__main__"] = _main_view
+except Exception:
+    pass
+
 import ctypes
 import winreg
 from ctypes import wintypes
@@ -72,10 +147,15 @@ except Exception:
 # ------------------------------------------------------------------ 常量 / 路径
 CREATE_NO_WINDOW = 0x08000000
 SHUTDOWN_DELAY = 25  # 立即关机前留给保存文件的秒数
-VERSION = "1.5.2"    # 版本号（发布新版前在这里递增；更新识别靠它）
+VERSION = "1.6.0"    # 版本号（发布新版前在这里递增；更新识别靠它）
 # 更新日志：版本号 -> 该版本更新条目（列表）。发布新版时在这里加一条（键 = 新版本号）；
 # 「发现新版本」窗会展示「已安装版本 < v <= 当前版本」区间内所有条目（最新在前）。
 CHANGELOG = {
+    "1.6.0": [
+        "打包体系从 PyInstaller 迁移到 Nuitka（C 编译）：onefile 支持解压缓存——首次启动解压一次，之后启动直接复用、不再重复解压。实测反复启动从 4.6 秒降至 0.6 秒左右；进程守护/看门狗重启同样受益。",
+        "新增启动图：首次启动解压期间显示「专注锁定 · 正在启动…」卡片，避免误以为没点成功（缓存命中后一闪而过）。",
+        "安装到本机零解压：安装时把程序文件从 exe 释放到安装目录下的 app\\ 子目录（受 ACL 保护），快捷方式与计划任务指向它，此后启动完全不经过解压；更新同样原地覆盖。",
+    ],
     "1.5.2": [
         "修复 Qt 版更新提示：装了旧版后运行新版，Qt 版此前不弹「发现更新」窗（只有 tkinter 版弹）——现补上 Qt 更新窗（更新日志 + 更新 / 稍后再说 / 跳过此版本）。",
         "补齐 Qt 与 tkinter 界面对齐：插件的 提示 / 确认 / 错误对话框在 Qt 下改用 Fluent 弹窗（此前被静默、且确认框恒为「是」）；主页补「解除已存在的关机计划」按钮。",
@@ -195,7 +275,7 @@ def _hide_console():
 
 
 def _self_path():
-    return sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+    return sys.executable if IS_FROZEN else os.path.abspath(__file__)
 
 
 def _pythonw_path():
@@ -209,10 +289,7 @@ def _pythonw_path():
 
 
 def _icon_path():
-    if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    else:
-        base = os.path.dirname(_self_path())
+    base = _meipass() if IS_FROZEN else os.path.dirname(_self_path())
     p = os.path.join(base, "lock_device.ico")
     return p if os.path.exists(p) else None
 
@@ -244,7 +321,7 @@ def is_admin():
 
 def relaunch_as_admin(extra_args=""):
     """以管理员身份重新启动本程序（弹一次 UAC）。成功返回 True。"""
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         exe, params = sys.executable, extra_args
     else:
         exe, params = _pythonw_path(), f'"{_self_path()}" {extra_args}'.strip()
@@ -333,7 +410,7 @@ def _xml_escape(s):
 
 
 def _main_name():
-    return "LockDevice.exe" if getattr(sys, "frozen", False) else "lock_device.py"
+    return "LockDevice.exe" if IS_FROZEN else "lock_device.py"
 
 
 def installed_dir():
@@ -349,8 +426,13 @@ def installed_dir():
 
 
 def installed_main():
+    """已安装版主程序路径：优先安装目录下的 app\\（解压固化态，启动零解压），
+    再回退旧的单文件安装（老用户未更新前的形态）。"""
     d = installed_dir()
-    return os.path.join(d, _main_name()) if d else None
+    if not d:
+        return None
+    app_exe = os.path.join(d, "app", _main_name())
+    return app_exe if os.path.exists(app_exe) else os.path.join(d, _main_name())
 
 
 def _version_file():
@@ -372,6 +454,21 @@ def _ver_tuple(s):
         return (0,)
 
 
+def _sync_installed_version():
+    """已安装版启动时（用户从开始菜单打开 app\\ 里的本体）自动刷新 version.txt。
+    场景：安装/更新由另一个实例（新版单文件 exe）完成——它写的是自己的版本号，
+    这里兜底同步，保证路径不同也不会误报「发现更新」。"""
+    try:
+        if not is_installed():
+            return
+        if _ver_tuple(installed_version()) != _ver_tuple(VERSION):
+            os.makedirs(ROOT_DIR, exist_ok=True)
+            with open(_version_file(), "w", encoding="utf-8") as f:
+                f.write(VERSION)
+    except OSError:
+        pass
+
+
 def has_update():
     """当前运行版本高于已安装版本 → 可原地更新。"""
     return is_installed() and _ver_tuple(VERSION) > _ver_tuple(installed_version())
@@ -389,7 +486,7 @@ def changelog_since(old_version):
 def _action_for(extra_args):
     """返回计划任务动作的 (Command, Arguments)。安装态优先用安装目录里的副本。"""
     m = installed_main() or _self_path()
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         return m, extra_args
     return _pythonw_path(), f'"{m}" {extra_args}'.strip()
 
@@ -581,7 +678,7 @@ def _prepare_protected_boot_exe():
     """绿色模式 + 已提权（勾了禁用任务管理器）建开机恢复任务前：把当前 exe 复制到受保护缓存
     目录（系统级临时目录）并上 ACL 锁，返回该受保护副本路径——开机任务指向它、病毒改不动，
     而非指向用户可写目录里的绿色 exe。已安装 / 非冻结返回 None（前者已指向 Program Files 受保护副本）。"""
-    if is_installed() or not getattr(sys, "frozen", False):
+    if is_installed() or not IS_FROZEN:
         return None
     dst = os.path.join(GREEN_CACHE_DIR, "LockDevice.exe")
     if DRY_RUN:
@@ -635,7 +732,7 @@ def _plugins_dirs():
     """插件目录（按加载顺序，去重）。冻结态：_MEIPASS/plugins（打包内置）+ exe 同级 plugins/
     （用户把 .py 丢进去即热添加）；源码态：脚本同级 plugins/。存在与否由调用方判断。"""
     dirs = []
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             dirs.append(os.path.join(meipass, "plugins"))                       # 打包内置
@@ -652,15 +749,25 @@ def _plugins_dirs():
 
 
 def _qt_available():
-    """gui 界面包 + PySide6 + qfluentwidgets 都在 → 用 Qt；否则回退 tkinter。
-    直接试导入 gui.app 最稳（源码/冻结都适用）：能导入即用（随后 main 直接调 run）。"""
+    """是否用 Qt 界面。返回 True 表示随后 import gui.app 并运行它。
+
+    · 打包时写入 _lockdevice_variant.txt（qt / tk）标注变体：
+        - 标注 tk → 直接 False，省掉每次启动对 PySide6 的探测导入；
+        - 标注 qt → 需要时导入一次，失败则回退 tk（防御异常产物）。
+    · 无标注（源码运行 / 旧产物）→ 沿用原「试导入」逻辑。"""
+    if VARIANT == "tk":
+        return False
+    global _QT_TRIED
+    if _QT_TRIED is not None:
+        return _QT_TRIED
     try:
         import PySide6            # noqa: F401
         import qfluentwidgets     # noqa: F401
         import gui.app            # noqa: F401
-        return True
+        _QT_TRIED = True
     except Exception:
-        return False
+        _QT_TRIED = False
+    return _QT_TRIED
 
 
 def load_plugins(force=False):
@@ -839,8 +946,9 @@ def create_shortcuts(desktop=False):
     """开始菜单（可选桌面）放带图标的 .lnk：打开=指向本体（靠程序自动分流免 UAC 提权）；
     卸载=本体 --uninstall（自提权一次）。"""
     d = installed_dir() or APP_DIR
-    if getattr(sys, "frozen", False):
-        target = os.path.join(d, "LockDevice.exe")
+    if IS_FROZEN:
+        # 指向安装目录下的 app 版本（解压固化、启动零解压）；旧单文件安装回退根目录 exe
+        target = installed_main() or os.path.join(d, "LockDevice.exe")
         base_args, icon = "", target
     else:
         target = _pythonw_path()
@@ -945,9 +1053,17 @@ def _kill_running_exe(exe_path):
 
 
 def _copy_with_retry(src, dst, tries=6):
-    """复制并少量重试，等待被结束的运行实例释放文件句柄。"""
+    """复制并少量重试，等待被结束的运行实例释放文件句柄。
+    优先硬链接（同盘时零额外占用、速度快）；失败（跨盘/不支持）再退回复制。"""
     last = None
     for _ in range(tries):
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.link(src, dst)
+            return
+        except OSError as e:
+            last = e
         try:
             shutil.copy2(src, dst)
             return
@@ -958,25 +1074,102 @@ def _copy_with_retry(src, dst, tries=6):
         raise last
 
 
+def _cache_bin_dir():
+    """onefile 解压缓存根目录（须与 build.py 的 --onefile-tempdir-spec 保持一致）。"""
+    la = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(la, "LockDevice", "bin")
+
+
+def _cleanup_version_cache(keep):
+    """安装/更新时清理解压缓存：只保留 keep（当前版本目录），其余删掉。
+    keep=None 表示全删（卸载时用）。onefile 的缓存与版本号绑定，更新后旧版本内容不再需要。"""
+    bin_dir = _cache_bin_dir()
+    try:
+        for name in os.listdir(bin_dir):
+            if keep is not None and name == keep:
+                continue
+            shutil.rmtree(os.path.join(bin_dir, name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _copy_tree(src, dst):
+    """把解压产物（_MEIPASS）复制为安装目录下的 app\\（standalone 形态，启动零解压）。"""
+    if getattr(sys, "_MEIPASS", None) == dst:
+        return
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def _kill_procs_under(d):
+    """结束安装目录（app\\）下的所有进程——更新时旧实例仍占用 DLL。"""
+    if not d:
+        return
+    d = os.path.abspath(d)
+    if os.path.basename(d).lower() != "app":
+        return
+    try:
+        ps = (
+            "$root = '" + _ps_quote(d) + "'; "
+            "Get-Process -ErrorAction SilentlyContinue | Where-Object { "
+            "try { $_.Path -and $_.Path.StartsWith($root, 'OrdinalIgnoreCase') "
+            "} catch { $false } } | Stop-Process -Force -ErrorAction SilentlyContinue")
+        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def _rename_or_rmtree(path, suffix=".old"):
+    """先改名后删除：正在被占用的旧 app\\ 目录改名后即可让出原路径，删除则失败无妨。"""
+    if not path or not os.path.exists(path):
+        return
+    old = path + suffix
+    try:
+        shutil.rmtree(old, ignore_errors=True)
+        os.rename(path, old)
+        shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def do_install(install_dir=None, desktop=True, launch=True):
     """执行安装。需管理员权限。返回 (成功?, 信息)。"""
     try:
         install_dir = (install_dir or APP_DIR).strip() or APP_DIR
         main_dst = os.path.join(install_dir, _main_name())
+        app_dst = os.path.join(install_dir, "app")
         if DRY_RUN:
             print(f"[DRY] 安装到 {install_dir}（desktop={desktop}, launch={launch}），写入 {INSTALL_FLAG}")
+            print(f"[DRY] 解压内容复制到 {app_dst}（冰冻态），此后启动零解压")
         else:
             os.makedirs(install_dir, exist_ok=True)
             src = _self_path()
             if os.path.abspath(src) != os.path.abspath(main_dst):
-                if getattr(sys, "frozen", False):
+                if IS_FROZEN:
                     _kill_running_exe(main_dst)   # 更新：先结束占用旧 exe 的实例，腾出文件
                 try:
                     _copy_with_retry(src, main_dst)
                 except OSError:
                     return False, ("更新/安装失败：目标文件被占用，无法覆盖。\n"
                                    "请手动关闭所有正在运行的 LockDevice 后重试。")
-            if not getattr(sys, "frozen", False):
+            if IS_FROZEN:
+                # 关键：把当前的解压产物（_MEIPASS）复制成安装目录下的 app\，
+                # 计划任务 / 快捷方式此后指向 app\LockDevice.exe —— 纯磁盘运行，启动零解压。
+                # （onefile 首次启动解压到缓存；安装即把它固化到受 ACL 保护的Program Files）
+                meipass = getattr(sys, "_MEIPASS", None)
+                app_exe = os.path.join(app_dst, _main_name())
+                already_app = meipass and os.path.normcase(os.path.abspath(meipass)) == \
+                    os.path.normcase(os.path.abspath(app_dst))
+                if meipass and not already_app:
+                    _kill_procs_under(app_dst)
+                    _rename_or_rmtree(app_dst)
+                    try:
+                        _copy_tree(meipass, app_dst)
+                    except (OSError, shutil.Error) as e:
+                        _log("复制 app 目录失败：%r" % (e,))
+                        return False, ("安装失败：无法释放程序文件到\n" + app_dst +
+                                       "\n（文件可能被占用，请关闭所有 LockDevice 实例后重试）")
+            if not IS_FROZEN:
                 ico = _icon_path()
                 if ico:
                     try:
@@ -988,6 +1181,7 @@ def do_install(install_dir=None, desktop=True, launch=True):
                 f.write(install_dir)
             with open(_version_file(), "w", encoding="utf-8") as f:
                 f.write(VERSION)
+            _cleanup_version_cache(VERSION)   # 旧版本解压缓存没用了
         # 安装目录上 ACL 锁：普通用户只读，防非管理员病毒篡改被「最高权限任务」运行的 exe
         _lock_dir_acl(install_dir)
         ok, msg = create_autostart_tasks()
@@ -1028,6 +1222,7 @@ def do_uninstall():
         for target in {d, APP_DIR}:   # 删默认与自定义安装目录，但绝不删数据根目录
             if target and os.path.isdir(target) and os.path.abspath(target) != os.path.abspath(ROOT_DIR):
                 shutil.rmtree(target, ignore_errors=True)
+        _cleanup_version_cache(None)   # 一并清掉 onefile 解压缓存（保留参数 None = 全删）
         try:
             os.remove(os.path.join(ROOT_DIR, "config.json"))
         except OSError:
@@ -1292,7 +1487,7 @@ def _app_cmd(*extra):
     安全：用「当前正在运行的本体」(_self_path)，不从用户可写的 installed.flag 推断路径——
     避免病毒改写 flag 让提权实例重生（看门狗 / 中继）时去运行被替换的文件。"""
     m = _self_path()
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         return [m, *extra]
     return [_pythonw_path(), m, *extra]
 
@@ -2356,8 +2551,9 @@ def _clear_stale_lock():
 def main():
     argv = sys.argv[1:]
     _hide_console()
+    _sync_installed_version()
     _log(f"launch argv={argv} exe={sys.executable} HAS_CTK={HAS_CTK} "
-         f"admin={is_admin()} installed={is_installed()}")
+         f"variant={VARIANT} admin={is_admin()} installed={is_installed()}")
 
     if "--guard" in argv:
         try:
@@ -2493,8 +2689,12 @@ def main():
         return
 
     if "--list-plugins" in argv:   # 诊断：打印已识别插件（也用于验证冻结态 _MEIPASS 加载）
+        # 窗口化编译的 exe 没有控制台，print 看不到 —— 同时写进 error.log 便于排查
+        _lines = []
         for meta, _mod in load_plugins():
-            print(f"{meta.get('id')}\t{meta.get('name', '')}\tv{meta.get('version', '')}")
+            _lines.append(f"{meta.get('id')}\t{meta.get('name', '')}\tv{meta.get('version', '')}")
+        print("\n".join(_lines))
+        _log("[list-plugins] " + (" | ".join(_lines) if _lines else "（无插件）"))
         return
 
     if "--gui-mode" in argv:       # 诊断：打印将采用的界面（qt / tk），验证冻结态自动切换

@@ -9,6 +9,7 @@ on:
       - 'lock_device.py'
       - 'build.py'
       - 'requirements.txt'
+      - 'scripts/make_splash.py'
       - '.github/workflows/release.yml'
   workflow_dispatch:
 
@@ -22,6 +23,7 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest      # 生成 Windows exe 必须用 Windows runner
+    timeout-minutes: 300         # Nuitka 编译 4 个变体较慢（MSVC+LTO，单变体 15-40 分钟）
     steps:
       - uses: actions/checkout@v4
 
