@@ -6,6 +6,6 @@ PySide6
 PySide6-Fluent-Widgets
 # 打包（Nuitka 编译为单文件 exe；[onefile] 额外带 zstandard，用于压缩 onefile 载荷）
 # 首次构建自动下载 MinGW64（本机无 MSVC 时），无需手工装工具链
-nuitka[onefile]
+nuitka[onefile]>=4.3.1,<5
 # 生成 onefile 启动图 splash.png（仅打包机需要，运行时不需要）
 pillow
