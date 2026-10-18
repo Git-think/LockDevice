@@ -618,6 +618,10 @@ class UpdateWindow(QWidget):
 
     def __init__(self):
         super().__init__()
+        # 深色主题背景：run_update_prompt()/run() 强制深色主题，而本窗是普通 QWidget
+        # （不像 FluentWindow 自带主题底色），浅色系统上会“浅底浅字”看不清——
+        # 与 LockWindow 同款做法：显式给窗口补上背景色。
+        self.setStyleSheet("background:#202020;")
         self.setWindowTitle("LockDevice · 发现新版本")
         ico = _app_icon()
         if not ico.isNull():
