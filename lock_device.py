@@ -457,10 +457,21 @@ def _ver_tuple(s):
 def _sync_installed_version():
     """已安装版启动时（用户从开始菜单打开 app\\ 里的本体）自动刷新 version.txt。
     场景：安装/更新由另一个实例（新版单文件 exe）完成——它写的是自己的版本号，
-    这里兜底同步，保证路径不同也不会误报「发现更新」。"""
+    这里兜底同步，保证路径不同也不会误报「发现更新」。
+
+    ⚠️ 只有「当前进程确实从安装目录里启动」时才允许同步：新版单文件在已装机器上启动时，
+    若这里先把 version.txt 刷成新版本号，随后的 has_update()（新版 > 新版 不成立）就会
+    恒为 False，「发现更新」窗永远不弹。"""
     try:
         if not is_installed():
             return
+        d = installed_dir()
+        if not d:
+            return
+        cur = os.path.normcase(os.path.abspath(_self_path()))
+        root = os.path.normcase(os.path.abspath(d)) + os.sep
+        if not cur.startswith(root):
+            return              # 跑的是外部副本（新版单文件/绿色/源码），不要动 version.txt
         if _ver_tuple(installed_version()) != _ver_tuple(VERSION):
             os.makedirs(ROOT_DIR, exist_ok=True)
             with open(_version_file(), "w", encoding="utf-8") as f:
